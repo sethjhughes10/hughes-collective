@@ -35,6 +35,21 @@ once it's offered (can take up to an hour).
 Sign in at `/app/` with your invited admin email (choose "Create your account" the first time).
 Go to **Admin › Invite a sibling**, pick their profile, enter their email, and send them the `/app/` link.
 
+## Next steps in Messages
+Above the chat box, a **Next steps** row offers one-tap suggestions built from the workspace itself:
+
+| Button | What a tap does |
+|---|---|
+| ✓ one of your open tasks (overdue and due-today first) | Asks to confirm, marks it done, and posts "✓ Done: …" in the channel |
+| ✓ the next step of a project you lead | Asks what the new next step is, saves it on the project, and posts the update |
+| + Take: an unassigned task | Asks to confirm, assigns it to you (unless someone beat you to it), and posts "I'll take …" |
+| Remind about the next meeting (within 7 days) | Drafts a reminder with the time and join link, ready to edit and send |
+| Check in on a sibling's project | Drafts a friendly "how's it going?" to its lead |
+| Channel prompts (e.g. "Share my week", "Log a decision") | Drafts a message and highlights the [fill-in] part |
+
+Drafts never send on their own. Anything that changes data asks first. The row can be collapsed and stays that way on that
+device. Edit the channel prompts in `STEP_PROMPTS` in `app/app.js`.
+
 ## Privacy & safety built in
 - Workspace data is locked to invited members by database rules (row-level security), not just hidden in the page.
 - Visitors can read public profiles and send the contact form, nothing else. Login IDs are never exposed.

@@ -19,6 +19,8 @@ const I = {
   admin: '<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
   more: '<circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/>',
   send: '<path d="M5 12h14M13 6l6 6-6 6"/>',
+  check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
 };
 const icon = (k, s = 20) => `<svg aria-hidden="true" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${I[k]}</svg>`;
 
@@ -29,6 +31,7 @@ const avatar = (slug, cls = '') => { const p = person(slug); return `<span class
 const fmtDate = (d) => d ? new Date(d + 'T12:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '';
 const fmtWhen = (ts) => new Date(ts).toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 const fmtTime = (ts) => { const d = new Date(ts); const today = new Date().toDateString() === d.toDateString(); return today ? d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }) : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }); };
+const localToday = () => new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD in the person's own time zone
 const peopleOptions = (sel = '', blank = true) => (blank ? '<option value="">No one yet</option>' : '') + S.people.map((p) => `<option value="${esc(p.slug)}" ${p.slug === sel ? 'selected' : ''}>${esc(p.first_name)}</option>`).join('');
 const lines = (s) => String(s || '').split('\n').map((x) => x.trim()).filter(Boolean);
 function fail(error, what = 'That didn’t save') { console.error(error); toast(`${what}. ${error?.message || 'Please try again.'}`, 5000); }
@@ -85,7 +88,13 @@ function renderAuth(mode = 'signin', note = '') {
 }
 
 // ---------- session
-async function enter() {
+// Sign-in can report twice on page load; share one run so screens don't load twice at once.
+let entering = null;
+function enter() {
+  entering ||= loadSession().finally(() => { entering = null; });
+  return entering;
+}
+async function loadSession() {
   const { data: { session } } = await sb.auth.getSession();
   S.session = session;
   if (!session) return renderAuth('signin');
@@ -293,6 +302,7 @@ async function messages(ch) {
   if (ch && CHANNELS.some(([k]) => k === ch)) S.channel = ch;
   const c = S.channel;
   stopChat();
+  const stepsP = loadNextSteps(c); // loads alongside the messages; never rejects
   const { data, error } = await sb.from('messages').select('*').eq('channel', c).order('created_at', { ascending: false }).limit(100);
   if (error) fail(error, 'Couldn’t load messages');
   const rows = (data || []).reverse();
@@ -301,9 +311,11 @@ async function messages(ch) {
     <div class="channel-tabs" role="group" aria-label="Channels">${CHANNELS.map(([k, l]) => `<button type="button" data-ch="${k}" aria-pressed="${k === c}">${l}</button>`).join('')}</div>
     <section class="card stack">
       <div class="chat" id="chat" aria-live="polite">${rows.length ? rows.map(msgHtml).join('') : '<p class="empty" id="chat-empty">No messages in this channel yet. Say hello.</p>'}</div>
+      <details class="next-steps" id="next-steps"><summary>Next steps</summary><div class="steps-body" aria-live="polite"><div class="step-chips" aria-hidden="true"><span class="skeleton step-skel"></span><span class="skeleton step-skel"></span><span class="skeleton step-skel"></span></div></div></details>
       <form class="composer" id="composer"><label class="sr-only" for="msg-input">Message</label><input id="msg-input" maxlength="4000" placeholder="Message ${esc(CHANNELS.find(([k]) => k === c)[1])}" autocomplete="off"><button class="icon-btn" style="background:var(--accent);color:#fff;border:0;width:48px;height:48px" aria-label="Send message">${icon('send')}</button></form>
     </section>`);
   const chat = document.getElementById('chat'); chat.scrollTop = chat.scrollHeight;
+  const input = document.getElementById('msg-input');
   $app.querySelectorAll('[data-ch]').forEach((b) => b.addEventListener('click', () => { location.hash = 'messages/' + b.dataset.ch; }));
   const seen = new Set(rows.map((r) => String(r.id)));
   const append = (m) => {
@@ -311,16 +323,159 @@ async function messages(ch) {
     document.getElementById('chat-empty')?.remove();
     chat.insertAdjacentHTML('beforeend', msgHtml(m)); chat.scrollTop = chat.scrollHeight;
   };
-  S.chatSub = sb.channel('chat-' + c)
+  const post = async (body, what = 'Message not sent') => {
+    const { data: row, error: err } = await sb.from('messages').insert({ channel: c, body, author_slug: S.me.slug }).select('*').single();
+    if (err) { fail(err, what); return null; }
+    append(row); return row;
+  };
+  stopChat(); // in case another load of this screen subscribed while we waited
+  S.chatSub = sb.channel(`chat-${c}-${Date.now()}`)
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `channel=eq.${c}` }, (payload) => append(payload.new))
     .subscribe();
+  const draft = { slot: '', warned: false }; // the [fill-in] part of a drafted prompt, if one is still unfilled
   document.getElementById('composer').addEventListener('submit', async (e) => {
-    e.preventDefault(); const input = document.getElementById('msg-input'); const body = input.value.trim(); if (!body) return;
-    input.value = '';
-    const { data: row, error: err } = await sb.from('messages').insert({ channel: c, body, author_slug: S.me.slug }).select('*').single();
-    if (err) { input.value = body; return fail(err, 'Message not sent'); }
-    append(row);
+    e.preventDefault(); const body = input.value.trim(); if (!body) return;
+    if (draft.slot && body.includes(draft.slot) && !draft.warned) {
+      draft.warned = true; selectSlot(input, draft.slot);
+      return toast('Fill in the part in [brackets], or tap send again to send it as is.', 4500);
+    }
+    draft.slot = ''; input.value = '';
+    if (!(await post(body))) input.value = body;
   });
+  nextSteps(document.getElementById('next-steps'), c, { input, post, draft }, stepsP);
+}
+
+// ---------- Next steps: one-tap suggestions above the chat box.
+// "say" drafts a message you can edit before sending, "do" makes a change after you confirm and
+// posts it to the channel, "go" opens the right page. Suggestions come from your tasks, projects
+// and meetings, plus a couple of prompts for each channel.
+const STEP_PROMPTS = {
+  collective: [['Share my week', 'This week I’m working on [what you’re working on].'], ['Ask everyone', 'Quick question for everyone: [your question]']],
+  website: [['Request a change', 'Website change request: [which page, and what should change]'], ['Report a problem', 'Something looks off on the website: [which page, and what you saw]']],
+  training: [['Share a training', 'Training worth a look: [name and link]'], ['Find a CE course', 'Does anyone know a good CE course on [topic]?']],
+  'business-setup': [['Log a decision', 'Decision made: [what we decided, and who does what next]'], ['Ask for a decision', 'We need to decide [what, and by when].']],
+};
+const STEPS_SHOWN = 5;
+const STEP_VERB = { finish: 'Mark done: ', advance: 'Mark next step done: ', claim: '', say: 'Draft a message: ', go: 'Open: ' };
+const stepsOpen = () => { try { return localStorage.getItem('hc-next-steps') !== 'closed'; } catch { return true; } };
+const rememberStepsOpen = (open) => { try { localStorage.setItem('hc-next-steps', open ? 'open' : 'closed'); } catch { /* storage blocked: just don't remember */ } };
+
+async function loadNextSteps(channel) {
+  const rows = (p) => p.then((r) => { if (r.error) console.error(r.error); return r.data || []; }, (e) => { console.error(e); return []; });
+  const [mine, unclaimed, projs, meets] = await Promise.all([
+    rows(sb.from('tasks').select('id,title,due_date,projects(title)').eq('assignee_slug', S.me.slug).eq('done', false).order('due_date', { ascending: true, nullsFirst: false }).limit(3)),
+    rows(sb.from('tasks').select('id,title,due_date,projects(title)').is('assignee_slug', null).eq('done', false).order('due_date', { ascending: true, nullsFirst: false }).limit(2)),
+    rows(sb.from('projects').select('id,title,status,lead_slug,next_step').neq('status', 'Done').order('created_at', { ascending: false }).limit(20)),
+    rows(sb.from('meetings').select('id,title,starts_at,duration_minutes,link').gte('starts_at', new Date().toISOString()).order('starts_at').limit(1)),
+  ]);
+  const today = localToday();
+  const when = (d) => (!d ? '' : d < today ? 'Overdue' : d === today ? 'Due today' : 'Due ' + fmtDate(d));
+  const steps = [];
+  mine.forEach((t) => steps.push({ kind: 'do', act: 'finish', id: t.id, label: t.title, project: t.projects?.title || '', sub: when(t.due_date) || t.projects?.title || '', late: !!t.due_date && t.due_date < today }));
+  projs.filter((p) => p.lead_slug === S.me.slug && p.next_step).slice(0, 2)
+    .forEach((p) => steps.push({ kind: 'do', act: 'advance', id: p.id, label: p.next_step, project: p.title, sub: p.title }));
+  unclaimed.forEach((t) => steps.push({ kind: 'do', act: 'claim', id: t.id, label: 'Take: ' + t.title, task: t.title, project: t.projects?.title || '', sub: when(t.due_date) || t.projects?.title || '' }));
+  const m = meets[0];
+  if (m && new Date(m.starts_at) - Date.now() < 7 * 864e5) {
+    steps.push({ kind: 'say', label: 'Remind about ' + m.title, sub: fmtTime(m.starts_at), text: `Reminder: ${m.title} is ${fmtWhen(m.starts_at)} (${m.duration_minutes} min).${safeUrl(m.link) ? ' Join here: ' + safeUrl(m.link) : ''}` });
+  } else if (!m && channel === 'collective') {
+    steps.push({ kind: 'go', label: 'Schedule a check-in', sub: 'Nothing on the calendar', href: '#meetings' });
+  }
+  projs.filter((p) => p.lead_slug && p.lead_slug !== S.me.slug && p.status !== 'On hold').slice(0, 2)
+    .forEach((p) => steps.push({ kind: 'say', label: 'Check in on ' + p.title, sub: firstName(p.lead_slug), text: `${firstName(p.lead_slug)}, how’s “${p.title}” going?${p.next_step ? ` Is “${p.next_step}” still the next step?` : ' What’s the next step?'}` }));
+  (STEP_PROMPTS[channel] || []).forEach(([label, text]) => steps.push({ kind: 'say', label, text }));
+  return steps;
+}
+
+function stepChip(s, i) {
+  const ic = { finish: 'check', advance: 'check', claim: 'plus' }[s.act] || (s.kind === 'go' ? 'send' : 'messages');
+  const inner = `${icon(ic, 16)}<span class="sr-only">${STEP_VERB[s.act || s.kind]}</span><span class="step-label">${esc(s.label)}</span>${s.sub ? `<span class="step-sub ${s.late ? 'late' : ''}">${esc(s.sub)}</span>` : ''}`;
+  return s.kind === 'go'
+    ? `<a class="step-chip go" href="${esc(s.href)}">${inner}</a>`
+    : `<button type="button" class="step-chip ${s.kind}" data-step="${i}">${inner}</button>`;
+}
+
+function selectSlot(input, slot) {
+  const at = slot ? input.value.indexOf(slot) : -1;
+  input.focus();
+  if (at >= 0) input.setSelectionRange(at, at + slot.length); else input.setSelectionRange(input.value.length, input.value.length);
+}
+
+function nextSteps(bar, channel, chat, stepsP) {
+  const body = bar.querySelector('.steps-body');
+  let steps = []; let showAll = false;
+  bar.open = stepsOpen();
+  bar.addEventListener('toggle', () => rememberStepsOpen(bar.open));
+  const draw = (focusIndex) => {
+    if (!bar.isConnected) return; // the person already left this channel
+    const shown = showAll ? steps : steps.slice(0, STEPS_SHOWN);
+    const extra = steps.length - STEPS_SHOWN;
+    body.innerHTML = steps.length
+      ? `<div class="step-chips">${shown.map(stepChip).join('')}${extra > 0 ? `<button type="button" class="step-chip more" data-more aria-expanded="${showAll}">${showAll ? 'Show fewer' : `${extra} more`}</button>` : ''}</div>`
+      : '<p class="meta" style="padding:6px 0">You’re all caught up.</p>';
+    if (focusIndex != null) (body.querySelector(`[data-step="${focusIndex}"]`) || body.querySelector('.step-chip'))?.focus();
+  };
+  const reload = async () => { steps = await loadNextSteps(channel); draw(); };
+
+  const confirm = (s, i) => {
+    const where = '#' + channel;
+    const ask = {
+      finish: `Mark “${s.label}” done and post it in ${where}?`,
+      advance: `Finished “${s.label}” on ${s.project}?`,
+      claim: `Take “${s.task}” and let ${where} know?`,
+    }[s.act];
+    const go = { finish: 'Mark done & post', advance: 'Save & post', claim: 'Take it & post' }[s.act];
+    body.innerHTML = `<form class="step-confirm">
+      <p style="font-size:15px;font-weight:600">${esc(ask)}</p>
+      ${s.act === 'advance' ? '<label class="field">What’s the next step now? (optional)<input name="next" maxlength="300" autocomplete="off"></label>' : ''}
+      <div class="step-actions"><button class="btn btn-primary btn-sm">${go}</button><button type="button" class="btn btn-ghost btn-sm" data-cancel>Cancel</button></div>
+    </form>`;
+    const f = body.querySelector('form');
+    (f.elements.next || f.querySelector('button')).focus();
+    f.querySelector('[data-cancel]').addEventListener('click', () => draw(i));
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      f.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+      const ok = await runStep(s, f.elements.next?.value.trim() || '', chat.post);
+      if (ok) { await reload(); chat.input.focus(); } else { f.querySelectorAll('button').forEach((b) => { b.disabled = false; }); }
+    });
+  };
+
+  body.addEventListener('click', (e) => {
+    if (e.target.closest('[data-more]')) { showAll = !showAll; draw(); body.querySelector('[data-more]')?.focus(); return; }
+    const b = e.target.closest('[data-step]'); if (!b) return;
+    const i = Number(b.dataset.step); const s = steps[i]; if (!s) return;
+    if (s.kind === 'do') return confirm(s, i);
+    // "say": put the prompt in the chat box, keep anything already typed, and select the [fill-in] part.
+    const typed = chat.input.value.trim();
+    chat.input.value = typed ? `${typed} ${s.text}` : s.text;
+    chat.draft.slot = (s.text.match(/\[[^\]]+\]/) || [''])[0]; chat.draft.warned = false;
+    selectSlot(chat.input, chat.draft.slot);
+  });
+
+  stepsP.then((list) => { steps = list; draw(); });
+}
+
+async function runStep(s, next, post) {
+  const proj = s.project ? ` (${s.project})` : '';
+  if (s.act === 'finish') {
+    const { error } = await sb.from('tasks').update({ done: true }).eq('id', s.id);
+    if (error) { fail(error); return false; }
+    await post(`✓ Done: ${s.label}${proj}`, 'Task marked done, but the chat post didn’t send');
+    toast('Task marked done.');
+  } else if (s.act === 'claim') {
+    const { data, error } = await sb.from('tasks').update({ assignee_slug: S.me.slug }).eq('id', s.id).is('assignee_slug', null).select('id');
+    if (error) { fail(error); return false; }
+    if (!data?.length) { toast('Someone already took that task.'); return true; }
+    await post(`I’ll take “${s.task}”${proj}.`, 'Task is yours, but the chat post didn’t send');
+    toast('Task assigned to you.');
+  } else if (s.act === 'advance') {
+    const { error } = await sb.from('projects').update({ next_step: next }).eq('id', s.id);
+    if (error) { fail(error); return false; }
+    await post(`✓ ${s.project}: finished “${s.label}”.${next ? ` Next step: ${next}` : ''}`, 'Project updated, but the chat post didn’t send');
+    toast('Project updated.');
+  }
+  return true;
 }
 
 // ---------- Meetings
