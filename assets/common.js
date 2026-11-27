@@ -25,6 +25,7 @@ export function safeColor(c, fallback = '#1E5B52') {
 }
 
 export function toast(text, ms = 3200) {
+  document.querySelectorAll('.toast').forEach((t) => t.remove()); // newest message replaces any still showing
   const el = document.createElement('div');
   el.className = 'toast';
   el.setAttribute('role', 'status');
